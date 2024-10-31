@@ -19,31 +19,37 @@ import io.micronaut.context.ApplicationContext;
 import io.micronaut.context.annotation.Factory;
 import io.micronaut.context.annotation.Primary;
 import io.micronaut.context.env.Environment;
+import io.micronaut.core.annotation.Nullable;
 import io.micronaut.core.io.ResourceResolver;
-import io.micronaut.core.io.socket.SocketUtils;
 import io.micronaut.core.reflect.ReflectionUtils;
+import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.http.server.exceptions.ServerStartupException;
 import io.micronaut.http.ssl.SslConfiguration;
-import io.micronaut.servlet.engine.DefaultMicronautServlet;
 import io.micronaut.servlet.engine.MicronautServletConfiguration;
+import io.micronaut.servlet.engine.initializer.MicronautServletInitializer;
 import io.micronaut.servlet.engine.server.ServletServerFactory;
 import io.micronaut.servlet.engine.server.ServletStaticResourceConfiguration;
+import io.micronaut.web.router.Router;
 import io.undertow.Handlers;
 import io.undertow.Undertow;
 import io.undertow.UndertowOptions;
-import io.undertow.server.handlers.PathHandler;
+import io.undertow.server.HttpHandler;
+import io.undertow.server.handlers.accesslog.AccessLogHandler;
 import io.undertow.servlet.Servlets;
-import io.undertow.servlet.api.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.xnio.Option;
-import org.xnio.Options;
-
+import io.undertow.servlet.api.DeploymentInfo;
+import io.undertow.servlet.api.DeploymentManager;
+import io.undertow.servlet.api.InstanceHandle;
+import io.undertow.servlet.api.ServletContainerInitializerInfo;
 import jakarta.inject.Singleton;
-import jakarta.servlet.Servlet;
+import jakarta.servlet.ServletContainerInitializer;
 import jakarta.servlet.ServletException;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import javax.net.ssl.SSLContext;
+import org.xnio.Option;
+import org.xnio.Options;
 
 /**
  * Factory for the undertow server.
@@ -54,9 +60,8 @@ import java.util.Map;
 @Factory
 public class UndertowFactory extends ServletServerFactory {
 
-    private static final Logger LOG = LoggerFactory.getLogger(UndertowFactory.class);
-
     private final UndertowConfiguration configuration;
+    private final Router router;
 
     /**
      * Default constructor.
@@ -75,6 +80,12 @@ public class UndertowFactory extends ServletServerFactory {
             List<ServletStaticResourceConfiguration> staticResourceConfigurations) {
         super(resourceResolver, configuration, sslConfiguration, applicationContext, staticResourceConfigurations);
         this.configuration = configuration;
+        this.router = applicationContext.findBean(Router.class).orElse(null);
+    }
+
+    @Override
+    public UndertowConfiguration getServerConfiguration() {
+        return (UndertowConfiguration) super.getServerConfiguration();
     }
 
     /**
@@ -90,40 +101,74 @@ public class UndertowFactory extends ServletServerFactory {
         final Undertow.Builder builder = configuration.getUndertowBuilder();
         int port = getConfiguredPort();
         String host = getConfiguredHost();
-        builder.addHttpListener(
-                port,
-                host
-        );
+
 
         final String cp = getContextPath();
         final DeploymentManager deploymentManager = Servlets.defaultContainer().addDeployment(deploymentInfo);
         deploymentManager
                 .deploy();
-        PathHandler path;
+        HttpHandler httpHandler;
         try {
-            path = Handlers.path(Handlers.redirect(cp))
+            httpHandler = Handlers.path(Handlers.redirect(cp))
                     .addPrefixPath(cp, deploymentManager.start());
         } catch (ServletException e) {
             throw new ServerStartupException("Error starting Undertow server: " + e.getMessage(), e);
         }
-        builder.setHandler(path);
+        UndertowConfiguration serverConfiguration = getServerConfiguration();
+        UndertowConfiguration.AccessLogConfiguration accessLogConfiguration = serverConfiguration.getAccessLogConfiguration().orElse(null);
+        if (accessLogConfiguration != null) {
+            httpHandler = new AccessLogHandler(
+                httpHandler,
+                accessLogConfiguration.builder.build(),
+                accessLogConfiguration.getPattern(),
+                getApplicationContext().getClassLoader()
+            );
+        }
+        builder.setHandler(httpHandler);
 
         final SslConfiguration sslConfiguration = getSslConfiguration();
         if (sslConfiguration.isEnabled()) {
             int sslPort = sslConfiguration.getPort();
             if (sslPort == SslConfiguration.DEFAULT_PORT && getEnvironment().getActiveNames().contains(Environment.TEST)) {
-                sslPort = SocketUtils.findAvailableTcpPort();
+                sslPort = 0; // random port
             }
             int finalSslPort = sslPort;
-            build(sslConfiguration).ifPresent(sslContext ->
-                    builder.addHttpsListener(
-                            finalSslPort,
-                            host,
-                            sslContext
-                    ));
+            SSLContext sslContext = build(sslConfiguration).orElse(null);
+            if (sslContext != null) {
+                builder.addHttpsListener(
+                    finalSslPort,
+                    host,
+                    sslContext
+                );
+                if (getServerConfiguration().isDualProtocol()) {
+                    builder.addHttpListener(
+                        port,
+                        host
+                    );
+                }
+                applyAdditionalPorts(builder, host, port, sslContext);
+            } else {
+                builder.addHttpListener(
+                    port,
+                    host
+                );
+                applyAdditionalPorts(builder, host, port, null);
+            }
 
+        } else {
+            builder.addHttpListener(
+                port,
+                host
+            );
+            applyAdditionalPorts(builder, host, port, null);
         }
 
+        if (servletConfiguration.getMaxThreads() != null) {
+            builder.setServerOption(Options.WORKER_TASK_MAX_THREADS, servletConfiguration.getMaxThreads());
+            if (servletConfiguration.getMinThreads() != null) {
+                builder.setServerOption(Options.WORKER_TASK_CORE_THREADS, servletConfiguration.getMinThreads());
+            }
+        }
         Map<String, String> serverOptions = configuration.getServerOptions();
         serverOptions.forEach((key, value) -> {
             Object opt = ReflectionUtils.findDeclaredField(UndertowOptions.class, key)
@@ -168,6 +213,27 @@ public class UndertowFactory extends ServletServerFactory {
         return builder;
     }
 
+    private void applyAdditionalPorts(Undertow.Builder builder, String host, int serverPort, @Nullable SSLContext sslContext) {
+        if (router != null) {
+            Set<Integer> exposedPorts = router.getExposedPorts();
+            if (CollectionUtils.isNotEmpty(exposedPorts)) {
+                for (Integer exposedPort : exposedPorts) {
+                    if (!exposedPort.equals(serverPort)) {
+                        addListener(builder, host, sslContext, exposedPort);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void addListener(Undertow.Builder builder, String host, SSLContext sslContext, Integer exposedPort) {
+        if (sslContext != null) {
+            builder.addHttpsListener(exposedPort, host, sslContext);
+        } else {
+            builder.addHttpListener(exposedPort, host);
+        }
+    }
+
     private Object getOptionValue(String key) {
         return ReflectionUtils.findDeclaredField(Options.class, key)
                 .map(field -> {
@@ -197,46 +263,53 @@ public class UndertowFactory extends ServletServerFactory {
      *
      * @param servletConfiguration The servlet configuration.
      * @return The deployment info
+     * @deprecated Use {@link #deploymentInfo(MicronautServletConfiguration, Collection)}
+     */
+    @Deprecated(forRemoval = true, since = "4.8.0")
+    protected DeploymentInfo deploymentInfo(MicronautServletConfiguration servletConfiguration) {
+        return deploymentInfo(servletConfiguration, getApplicationContext().getBeansOfType(ServletContainerInitializer.class));
+    }
+
+    /**
+     * The deployment info bean.
+     *
+     * @param servletConfiguration The servlet configuration.
+     * @param servletInitializers The servlet initializer
+     * @return The deployment info
      */
     @Singleton
     @Primary
-    protected DeploymentInfo deploymentInfo(MicronautServletConfiguration servletConfiguration) {
+    protected DeploymentInfo deploymentInfo(MicronautServletConfiguration servletConfiguration, Collection<ServletContainerInitializer> servletInitializers) {
         final String cp = getContextPath();
-
-        ServletInfo servletInfo = Servlets.servlet(
-                servletConfiguration.getName(), DefaultMicronautServlet.class, () -> new InstanceHandle<Servlet>() {
-
-                    private DefaultMicronautServlet instance;
-
-                    @Override
-                    public Servlet getInstance() {
-                        instance = new DefaultMicronautServlet(getApplicationContext());
-                        return instance;
-                    }
-
-                    @Override
-                    public void release() {
-                        if (instance != null) {
-                            instance.destroy();
-                        }
-                    }
-                }
-        );
-        Boolean isAsync = getApplicationContext().getEnvironment().getProperty("micronaut.server.testing.async", Boolean.class, true);
-        if (Boolean.FALSE.equals(isAsync)) {
-            LOG.warn("Async support disabled for testing purposes.");
+        for (ServletContainerInitializer servletInitializer : servletInitializers) {
+            if (servletInitializer instanceof MicronautServletInitializer micronautServletInitializer) {
+                getStaticResourceConfigurations().forEach(config ->
+                    micronautServletInitializer.addMicronautServletMapping(config.getMapping())
+                );
+            }
         }
-        servletInfo.setAsyncSupported(isAsync);
-        servletInfo.addMapping(servletConfiguration.getMapping());
-        getStaticResourceConfigurations().forEach(config -> {
-            servletInfo.addMapping(config.getMapping());
-        });
-        final DeploymentInfo deploymentInfo = Servlets.deployment()
-                .setDeploymentName(servletConfiguration.getName())
-                .setClassLoader(getEnvironment().getClassLoader())
-                .setContextPath(cp)
-                .addServlet(servletInfo);
-        servletConfiguration.getMultipartConfigElement().ifPresent(deploymentInfo::setDefaultMultipartConfig);
+        DeploymentInfo deploymentInfo = Servlets.deployment()
+            .setDeploymentName(servletConfiguration.getName())
+            .setClassLoader(getEnvironment().getClassLoader())
+            .setContextPath(cp);
+        for (ServletContainerInitializer servletInitializer : servletInitializers) {
+            deploymentInfo
+                .addServletContainerInitializer(new ServletContainerInitializerInfo(
+                    servletInitializer.getClass(),
+                    () -> new InstanceHandle<>() {
+                        @Override
+                        public ServletContainerInitializer getInstance() {
+                            return servletInitializer;
+                        }
+
+                        @Override
+                        public void release() {
+
+                        }
+                    },
+                    Set.of(servletInitializer.getClass())
+                ));
+        }
         return deploymentInfo;
     }
 

@@ -4,8 +4,9 @@ plugins {
 
 dependencies {
     annotationProcessor mn.micronaut.graal
+    annotationProcessor(projects.micronautServletProcessor)
 
-    api(projects.micronautServletCore)
+    api(projects.micronautServletApi)
     api libs.managed.servlet.api
 
     implementation(mnReactor.micronaut.reactor)

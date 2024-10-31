@@ -22,24 +22,26 @@ import io.micronaut.core.convert.ArgumentConversionContext;
 import io.micronaut.core.convert.ConversionContext;
 import io.micronaut.core.convert.ConversionService;
 import io.micronaut.core.convert.value.MutableConvertibleValues;
-import io.micronaut.core.convert.value.MutableConvertibleValuesMap;
-import io.micronaut.core.execution.ExecutionFlow;
-import io.micronaut.core.io.buffer.ByteBuffer;
 import io.micronaut.core.type.Argument;
 import io.micronaut.core.util.ArrayUtils;
 import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.util.StringUtils;
 import io.micronaut.core.util.SupplierUtil;
-import io.micronaut.http.FullHttpRequest;
 import io.micronaut.http.HttpHeaders;
 import io.micronaut.http.HttpMethod;
 import io.micronaut.http.HttpParameters;
+import io.micronaut.http.HttpRequest;
+import io.micronaut.http.HttpVersion;
 import io.micronaut.http.MediaType;
 import io.micronaut.http.MutableHttpRequest;
+import io.micronaut.http.ServerHttpRequest;
+import io.micronaut.http.body.ByteBody;
+import io.micronaut.http.body.CloseableByteBody;
+import io.micronaut.http.body.stream.InputStreamByteBody;
 import io.micronaut.http.codec.MediaTypeCodecRegistry;
 import io.micronaut.http.cookie.Cookies;
 import io.micronaut.servlet.http.BodyBuilder;
-import io.micronaut.servlet.http.ByteArrayByteBuffer;
+import io.micronaut.servlet.http.ByteArrayBufferFactory;
 import io.micronaut.servlet.http.ParsedBodyHolder;
 import io.micronaut.servlet.http.ServletExchange;
 import io.micronaut.servlet.http.ServletHttpRequest;
@@ -59,6 +61,7 @@ import reactor.core.publisher.Sinks;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.Charset;
@@ -73,27 +76,28 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.function.Supplier;
 
 /**
- * Implementation of {@link io.micronaut.http.HttpRequest} ontop of the Servlet API.
+ * Implementation of {@link HttpRequest} ontop of the Servlet API.
  *
  * @param <B> The body type
  * @author graemerocher
  * @since 1.0.0
  */
 @Internal
-public final class DefaultServletHttpRequest<B> extends MutableConvertibleValuesMap<Object> implements
+public final class DefaultServletHttpRequest<B> implements
     ServletHttpRequest<HttpServletRequest, B>,
-    MutableConvertibleValues<Object>,
     ServletExchange<HttpServletRequest, HttpServletResponse>,
     StreamedServletMessage<B, byte[]>,
-    FullHttpRequest<B>,
+    ServerHttpRequest<B>,
     ParsedBodyHolder<B> {
 
     private static final Logger LOG = LoggerFactory.getLogger(DefaultServletHttpRequest.class);
+    private static final String NULL_KEY = "Attribute key cannot be null";
 
     private final ConversionService conversionService;
     private final HttpServletRequest delegate;
@@ -103,11 +107,12 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
     private final ServletParameters parameters;
     private final DefaultServletHttpResponse<B> response;
     private final MediaTypeCodecRegistry codecRegistry;
+    private final MutableConvertibleValues<Object> attributes;
+    private final CloseableByteBody byteBody;
     private DefaultServletCookies cookies;
     private Supplier<Optional<B>> body;
 
     private boolean bodyIsReadAsync;
-    private ByteArrayByteBuffer<B> servletByteBuffer;
     private B parsedBody;
 
     /**
@@ -118,16 +123,20 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
      * @param response          The servlet response
      * @param codecRegistry     The codec registry
      * @param bodyBuilder       Body Builder
+     * @param ioExecutor        Executor for blocking operations
      */
     protected DefaultServletHttpRequest(ConversionService conversionService,
                                         HttpServletRequest delegate,
                                         HttpServletResponse response,
                                         MediaTypeCodecRegistry codecRegistry,
-                                        BodyBuilder bodyBuilder) {
-        super(new ConcurrentHashMap<>(), conversionService);
+                                        BodyBuilder bodyBuilder,
+                                        Executor ioExecutor) {
+        super();
         this.conversionService = conversionService;
         this.delegate = delegate;
         this.codecRegistry = codecRegistry;
+        long contentLengthLong = delegate.getContentLengthLong();
+        this.byteBody = InputStreamByteBody.create(new LazyDelegateInputStream(delegate), contentLengthLong < 0 ? OptionalLong.empty() : OptionalLong.of(contentLengthLong), ioExecutor, ByteArrayBufferFactory.INSTANCE);
 
         String requestURI = delegate.getRequestURI();
 
@@ -151,11 +160,78 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
             B built = parsedBody != null ? parsedBody : (B) bodyBuilder.buildBody(this::getInputStream, this);
             return Optional.ofNullable(built);
         });
+        this.attributes = new MutableConvertibleValues<>() {
+
+            @Override
+            public <T> Optional<T> get(CharSequence name, ArgumentConversionContext<T> conversionContext) {
+                Objects.requireNonNull(conversionContext, "Conversion context cannot be null");
+                Objects.requireNonNull(name, NULL_KEY);
+                Object attribute = null;
+                try {
+                    attribute = delegate.getAttribute(name.toString());
+                } catch (IllegalStateException e) {
+                    // ignore, request not longer active
+                }
+                return Optional.ofNullable(attribute)
+                        .flatMap(v -> conversionService.convert(v, conversionContext));
+            }
+
+            @Override
+            public Set<String> names() {
+                try {
+                    return CollectionUtils.enumerationToSet(delegate.getAttributeNames());
+                } catch (IllegalStateException e) {
+                    // ignore, request no longer active
+                    return Set.of();
+                }
+            }
+
+            @Override
+            public Collection<Object> values() {
+                try {
+                    return names().stream().map(delegate::getAttribute).toList();
+                } catch (IllegalStateException e) {
+                    // ignore, request no longer active
+                    return Collections.emptyList();
+                }
+            }
+
+            @Override
+            public MutableConvertibleValues<Object> put(CharSequence key, @Nullable Object value) {
+                Objects.requireNonNull(key, NULL_KEY);
+                delegate.setAttribute(key.toString(), value);
+                return this;
+            }
+
+            @Override
+            public MutableConvertibleValues<Object> remove(CharSequence key) {
+                Objects.requireNonNull(key, NULL_KEY);
+                delegate.removeAttribute(key.toString());
+                return this;
+            }
+
+            @Override
+            public MutableConvertibleValues<Object> clear() {
+                names().forEach(delegate::removeAttribute);
+                return this;
+            }
+        };
+    }
+
+    /**
+     * @return The conversion service.
+     */
+    public ConversionService getConversionService() {
+        return conversionService;
     }
 
     @Override
-    public ConversionService getConversionService() {
-        return this.conversionService;
+    public HttpVersion getHttpVersion() {
+        String protocol = getNativeRequest().getProtocol();
+        return switch (protocol) {
+            case "HTTP/2.0" -> HttpVersion.HTTP_2_0;
+            default -> ServletHttpRequest.super.getHttpVersion();
+        };
     }
 
     /**
@@ -254,14 +330,15 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
         return delegate.getContextPath();
     }
 
+    @SuppressWarnings("resource")
     @Override
     public InputStream getInputStream() throws IOException {
-        return servletByteBuffer != null ? servletByteBuffer.toInputStream() : delegate.getInputStream();
+        return byteBody().split(ByteBody.SplitBackpressureMode.FASTEST).toInputStream();
     }
 
     @Override
     public BufferedReader getReader() throws IOException {
-        return delegate.getReader();
+        return new BufferedReader(new InputStreamReader(getInputStream(), getCharacterEncoding()));
     }
 
     @Override
@@ -323,7 +400,7 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
     @NonNull
     @Override
     public MutableConvertibleValues<Object> getAttributes() {
-        return this;
+        return this.attributes;
     }
 
     @Override
@@ -335,17 +412,6 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
     @Override
     public Optional<B> getBody() {
         return this.body.get();
-    }
-
-    @Override
-    public MutableConvertibleValues<Object> put(CharSequence key, @Nullable Object value) {
-        String name = Objects.requireNonNull(key, "Key cannot be null").toString();
-        if (value == null) {
-            super.remove(name);
-        } else {
-            super.put(name, value);
-        }
-        return this;
     }
 
     @SuppressWarnings("unchecked")
@@ -433,35 +499,8 @@ public final class DefaultServletHttpRequest<B> extends MutableConvertibleValues
     }
 
     @Override
-    public boolean isFull() {
-        return !bodyIsReadAsync;
-    }
-
-    @Override
-    public ByteBuffer<?> contents() {
-        if (bodyIsReadAsync) {
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Body is read asynchronously, cannot get contents");
-            }
-            return null;
-        }
-        try {
-            if (servletByteBuffer == null) {
-                this.servletByteBuffer = new ByteArrayByteBuffer<>(delegate.getInputStream().readAllBytes());
-            }
-            return servletByteBuffer;
-        } catch (IOException e) {
-            throw new IllegalStateException("Error getting all body contents", e);
-        }
-    }
-
-    @Override
-    public ExecutionFlow<ByteBuffer<?>> bufferContents() {
-        ByteBuffer<?> contents = contents();
-        if (contents == null) {
-            return null;
-        }
-        return ExecutionFlow.just(contents);
+    public @NonNull ByteBody byteBody() {
+        return byteBody;
     }
 
     /**
