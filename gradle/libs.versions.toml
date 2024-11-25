@@ -12,8 +12,8 @@ undertow = '2.3.18.Final'
 tomcat = '11.0.1'
 bcpkix = "1.70"
 
-managed-jetty = '11.0.24'
 managed-apache-http-core5 = "5.3.1"
+managed-jetty = '12.0.15'
 micronaut-reactor = "3.6.0"
 micronaut-security = "4.11.2"
 micronaut-serde = "2.12.0"
@@ -49,8 +49,8 @@ kotlin-reflect = { module = 'org.jetbrains.kotlin:kotlin-reflect' }
 apache-http-core5 = { module = 'org.apache.httpcomponents.core5:httpcore5', version.ref = 'managed-apache-http-core5' }
 tomcat-embed-core = { module = 'org.apache.tomcat.embed:tomcat-embed-core', version.ref = 'tomcat' }
 undertow-servlet = { module = 'io.undertow:undertow-servlet', version.ref = 'undertow' }
-jetty-servlet = { module = 'org.eclipse.jetty:jetty-servlet', version.ref = 'managed-jetty' }
-jetty-http2-server = { module = 'org.eclipse.jetty.http2:http2-server', version.ref = 'managed-jetty' }
+jetty-servlet = { module = 'org.eclipse.jetty.ee10:jetty-ee10-servlet', version.ref = 'managed-jetty' }
+jetty-http2-server = { module = 'org.eclipse.jetty.http2:jetty-http2-server', version.ref = 'managed-jetty' }
 jetty-alpn-server = { module = 'org.eclipse.jetty:jetty-alpn-server', version.ref = 'managed-jetty' }
 jetty-alpn-conscrypt-server = { module = 'org.eclipse.jetty:jetty-alpn-conscrypt-server', version.ref = 'managed-jetty' }
 kotest-runner = { module = 'io.kotest:kotest-runner-junit5', version.ref = 'kotest-runner' }
